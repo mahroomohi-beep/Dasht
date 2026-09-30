@@ -1,5 +1,5 @@
 // Service worker: offline support for Dasht Barakat
-const VERSION = 'dasht-pwa-v378-1';
+const VERSION = 'dasht-pwa-v378-2';
 const SHELL = ['./', './index.html', './manifest.json',
   './icon-192.png', './icon-512.png',
   './icon-512-maskable.png', './apple-touch-icon.png'];

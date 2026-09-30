@@ -41,91 +41,142 @@
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <link rel="icon" type="image/png" href="icon-192.png">
 <script>
-/* PWA save layer: mirrors the game's localStorage save into IndexedDB, restores it if the browser wiped
-   localStorage, asks the browser for persistent storage, and registers the offline service worker. */
+/* Dasht save layer v2 — redundant stores (localStorage + IndexedDB + Cache + OPFS), rolling snapshots,
+   frequent autosave, newest-valid restore, file backup/restore, on-screen diagnostics. Game code untouched. */
 (function(){
-  var KEY='dasht-barakat-production-v362', BAK=KEY+'-bak';
-  var DB='dasht-save-mirror', ST='kv';
-  var ls, origSet, restoring=false, pending={}, timer=null;
-  try{ ls=window.localStorage; origSet=Storage.prototype.setItem; }catch(e){ return; }
-
-  function idb(){return new Promise(function(res,rej){
-    if(!window.indexedDB){rej(new Error('no idb'));return;}
-    var r=indexedDB.open(DB,1);
-    r.onupgradeneeded=function(){r.result.createObjectStore(ST);};
-    r.onsuccess=function(){res(r.result);};
-    r.onerror=function(){rej(r.error);};
-  });}
-  function idbPut(k,v){return idb().then(function(db){return new Promise(function(res,rej){
-    var t=db.transaction(ST,'readwrite'); t.objectStore(ST).put(v,k);
-    t.oncomplete=function(){db.close();res();}; t.onerror=function(){rej(t.error);};
-  });});}
-  function idbGet(k){return idb().then(function(db){return new Promise(function(res,rej){
-    var t=db.transaction(ST,'readonly'), q=t.objectStore(ST).get(k);
-    q.onsuccess=function(){db.close();res(q.result);}; q.onerror=function(){rej(q.error);};
-  });});}
-
-  function flushMirror(){
-    timer=null; var p=pending; pending={};
-    Object.keys(p).forEach(function(k){ idbPut(k,p[k]).catch(function(){}); });
+'use strict';
+var KEY='dasht-barakat-production-v362',BAK=KEY+'-bak',FB='dashtLastFileBackup',DBN='dasht-save-v2',ST='s',CN='dasht-save-cache-v2',FN='dasht-save.json';
+var ls=null,set0=Storage.prototype.setItem;
+try{ls=window.localStorage;ls.getItem(KEY);}catch(e){ls=null;}
+var S0={ls:!!ls,persist:null,err:''},restoring=false,q={},qt=null,snapAt=0;
+var fa=function(n){try{return Number(n).toLocaleString('fa-IR');}catch(e){return n;}};
+function valid(raw){try{var o=JSON.parse(raw);if(o&&Array.isArray(o.plots)&&o.plots.length&&Array.isArray(o.isl)&&o.inv&&typeof o.inv==='object'&&o.up&&typeof o.up==='object')return{o:o,t:+o.t||0};}catch(e){}return null;}
+/* ---- IndexedDB ---- */
+var dbp=null;
+function db(){return dbp||(dbp=new Promise(function(ok,no){try{var r=indexedDB.open(DBN,1);r.onupgradeneeded=function(){r.result.createObjectStore(ST);};r.onsuccess=function(){ok(r.result);};r.onerror=r.onblocked=function(){no(r.error||new Error('idb'));};setTimeout(function(){no(new Error('idb timeout'));},4000);}catch(e){no(e);}}));}
+function tx(m,fn){return db().then(function(d){return new Promise(function(ok,no){var t=d.transaction(ST,m),r=fn(t.objectStore(ST));t.oncomplete=function(){ok(r&&r.result);};t.onerror=t.onabort=function(){no(t.error);};});});}
+var iPut=function(k,v){return tx('readwrite',function(s){return s.put(v,k);});},iGet=function(k){return tx('readonly',function(s){return s.get(k);});},iAll=function(){return tx('readonly',function(s){return s.getAll();});},iKeys=function(){return tx('readonly',function(s){return s.getAllKeys();});},iDel=function(k){return tx('readwrite',function(s){return s.delete(k);});};
+/* ---- Cache Storage + OPFS ---- */
+var cu=function(n){return new URL(n||'__dasht_save__',location.href).href;};
+var cPut=function(v,n){return caches.open(CN).then(function(c){return c.put(cu(n),new Response(JSON.stringify(v)));});};
+var cGet=function(n){return caches.open(CN).then(function(c){return c.match(cu(n));}).then(function(r){return r?r.json():null;});};
+var oPut=async function(v,n){var d=await navigator.storage.getDirectory(),h=await d.getFileHandle(n||FN,{create:true}),w=await h.createWritable();await w.write(JSON.stringify(v));await w.close();};
+var oGet=async function(n){var d=await navigator.storage.getDirectory(),h=await d.getFileHandle(n||FN),f=await h.getFile();return JSON.parse(await f.text());};
+var ok1=function(){return true;},no1=function(){return false;};
+/* ---- mirror every save into the other stores ---- */
+function mirror(k,raw){q[k]=raw;if(!qt)qt=setTimeout(flush,1200);}
+async function flush(){
+  qt=null;var p=q;q={};
+  if(p[BAK]){var bv=valid(p[BAK]);if(bv)iPut('bak',{raw:p[BAK],t:bv.t,at:Date.now()}).catch(no1);}
+  var raw=p[KEY],v=raw&&valid(raw);if(!v)return;
+  var rec={raw:raw,t:v.t,at:Date.now()};
+  S0.idb=await iPut('latest',rec).then(ok1,no1);
+  S0.cache=await cPut(rec).then(ok1,no1);
+  S0.opfs=await oPut(rec).then(ok1,no1);
+  if(rec.at-snapAt>1200000){snapAt=rec.at;await iPut('snap-'+rec.at,{raw:raw,t:v.t,at:rec.at,snap:true}).catch(no1);
+    try{var ks=(await iKeys()).filter(function(k){return String(k).indexOf('snap-')===0;}).sort();ks.slice(0,-12).forEach(function(k){iDel(k).catch(no1);});}catch(e){}}
+  S0.mirrorAt=Date.now();
+}
+Storage.prototype.setItem=function(k,v){
+  if(this===ls&&(k===KEY||k===BAK)){
+    if(restoring)return;
+    try{set0.call(this,k,v);}catch(e){S0.err='localStorage: '+(e&&e.name);mirror(k,String(v));throw e;}
+    mirror(k,String(v));return;
   }
-  function queueMirror(k,v){
-    pending[k]=v;
-    if(!timer) timer=setTimeout(flushMirror,1500);
-  }
-
-  // Intercept the game's own save writes (no change to the game code)
-  Storage.prototype.setItem=function(k,v){
-    if(this===ls && (k===KEY||k===BAK)){
-      if(restoring) return;            // don't let a blank new game overwrite the backup while restoring
-      origSet.call(this,k,v);
-      queueMirror(k,String(v));
-      return;
-    }
-    return origSet.call(this,k,v);
-  };
-  function flushNow(){ if(timer){clearTimeout(timer);} flushMirror(); }
-  window.addEventListener('pagehide',flushNow);
-  document.addEventListener('visibilitychange',function(){ if(document.visibilityState==='hidden') flushNow(); });
-
-  // If localStorage lost the save but the IndexedDB copy exists, restore it and reload once
-  var missing=false;
-  try{ missing=(ls.getItem(KEY)===null); }catch(e){}
-  if(missing && window.indexedDB){
-    restoring=true;
-    var done=function(){ restoring=false; };
-    var guard=setTimeout(done,3000);
-    idbGet(KEY).then(function(raw){
-      clearTimeout(guard);
-      if(raw && !sessionStorage.getItem('dashtRestored')){
-        origSet.call(ls,KEY,raw);
-        return idbGet(BAK).then(function(b){ if(b) origSet.call(ls,BAK,b); }).catch(function(){}).then(function(){
-          try{sessionStorage.setItem('dashtRestored','1');}catch(e){}
-          location.reload();
-        });
-      }
-      done();
-    }).catch(function(){ clearTimeout(guard); done(); });
-  }
-
-  // Ask for persistent storage so the browser doesn't clear the save under storage pressure
+  return set0.apply(this,arguments);
+};
+function nowSave(r){try{if(typeof window.__dashtNativeFlush==='function')window.__dashtNativeFlush(r);}catch(e){}}
+setInterval(function(){if(document.visibilityState==='visible')nowSave('auto-v2');},12000);
+function bye(){nowSave('bye-v2');flush();}
+window.addEventListener('pagehide',bye);window.addEventListener('freeze',bye);
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')bye();});
+/* ---- persistent storage ---- */
+function persist(){try{navigator.storage.persist().then(function(p){S0.persist=p;});}catch(e){}}
+try{navigator.storage.persisted().then(function(p){S0.persist=p;});}catch(e){}
+addEventListener('pointerdown',persist,{once:true});
+/* ---- write a chosen save into localStorage safely, then reload ---- */
+function apply(raw,bump){
+  var v=valid(raw);if(!v||!ls)return false;
+  if(bump)v.o.t=Date.now();
+  restoring=true;                       // stops the game's own pagehide save from overwriting it
+  try{var cur=ls.getItem(KEY);if(cur&&valid(cur))set0.call(ls,KEY+'-pre-import-v365',cur);}catch(e){}
+  try{set0.call(ls,KEY,JSON.stringify(v.o));}catch(e){restoring=false;return false;}
+  try{sessionStorage.setItem('dashtRestoreAt',String(Date.now()));}catch(e){}
+  location.reload();return true;
+}
+/* ---- startup: find the newest valid copy anywhere; restore if localStorage is missing/older ---- */
+(async function boot(){
+  restoring=true;var guard=setTimeout(function(){restoring=false;},3500);
   try{
-    if(navigator.storage && navigator.storage.persist){
-      navigator.storage.persist().catch(function(){});
-      window.addEventListener('pointerdown',function once(){
-        window.removeEventListener('pointerdown',once);
-        navigator.storage.persist().catch(function(){});
-      });
-    }
-  }catch(e){}
-
-  // Offline / installable
-  if('serviceWorker' in navigator && /^https?:$/.test(location.protocol)){
-    window.addEventListener('load',function(){
-      navigator.serviceWorker.register('sw.js').catch(function(){});
-    });
-  }
+    var lraw=ls&&ls.getItem(KEY),lv=lraw&&valid(lraw),lt=lv?lv.t:0;
+    var r=await Promise.all([iAll().catch(function(){return[];}),cGet().catch(no1),oGet().catch(no1)]);
+    var c=(r[0]||[]).concat([r[1],r[2]]).filter(function(x){return x&&x.raw;}),best=null;
+    (r[0]||[]).forEach(function(x){if(x&&x.snap&&x.at>snapAt)snapAt=x.at;});
+    c.forEach(function(x){var v=valid(x.raw);if(v&&(!best||v.t>best.t))best={raw:x.raw,t:v.t};});
+    if(!lv&&ls){var b=ls.getItem(BAK),bv=b&&valid(b);if(bv&&(!best||bv.t>best.t))best={raw:b,t:bv.t};}
+    var last=+(sessionStorage.getItem('dashtRestoreAt')||0);
+    if(best&&best.t>lt+2000&&Date.now()-last>30000&&ls){clearTimeout(guard);S0.restored=lt?'newer copy':'lost save';
+      set0.call(ls,'dashtRestoredNote',String(Date.now()));apply(best.raw,false);return;}
+  }catch(e){S0.err='boot: '+(e&&e.message);}
+  clearTimeout(guard);restoring=false;
 })();
+/* ---- file backup / restore (same format as the game's own export) ---- */
+function raw(){nowSave('export-v2');return ls&&ls.getItem(KEY);}
+function payload(){var rw=raw(),v=rw&&valid(rw);return v?{format:'dasht-barakat-save',backupVersion:1,game:'دشت برکت',gameBuild:'v378-save-layer-2',stateSchema:v.o.schema||0,createdAt:new Date().toISOString(),createdAtMs:Date.now(),storageKey:KEY,state:v.o}:null;}
+function fname(){var d=new Date(),p=function(n){return String(n).padStart(2,'0');};return'Dasht_Barakat_Save_'+d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'_'+p(d.getHours())+'-'+p(d.getMinutes())+'.json';}
+function mark(){try{set0.call(ls,FB,String(Date.now()));}catch(e){}}
+function toast(t){var d=document.createElement('div');d.textContent=t;d.style.cssText='position:fixed;left:50%;transform:translateX(-50%);bottom:70px;z-index:2147483647;background:#111d;color:#fff;padding:9px 14px;border-radius:12px;font:13px/1.5 system-ui;max-width:86vw;text-align:center';document.body.appendChild(d);setTimeout(function(){d.remove();},2800);}
+function download(){var p=payload();if(!p)return toast('❌ ذخیره‌ی معتبری پیدا نشد');var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(p)],{type:'application/json'}));a.download=fname();document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(a.href);},3000);mark();toast('✅ فایل پشتیبان ساخته شد (پوشه‌ی Download)');}
+function share(){var p=payload();if(!p)return toast('❌ ذخیره‌ی معتبری پیدا نشد');var f=new File([JSON.stringify(p)],fname(),{type:'application/json'});
+  if(navigator.canShare&&navigator.canShare({files:[f]}))navigator.share({files:[f],title:'پشتیبان دشت برکت'}).then(mark,function(){});else download();}
+function pick(){var i=document.createElement('input');i.type='file';i.accept='.json,application/json';i.style.display='none';document.body.appendChild(i);
+  i.onchange=function(){var f=i.files&&i.files[0];i.remove();if(!f)return;f.text().then(function(t){var o=JSON.parse(t),st=o&&o.format==='dasht-barakat-save'?o.state:o;
+    if(!valid(JSON.stringify(st)))return toast('❌ فایل معتبر نیست');
+    if(!confirm('ذخیره‌ی فعلی با این فایل جایگزین شود؟ (یک نسخه‌ی اضطراری نگه داشته می‌شود)'))return;
+    if(!apply(JSON.stringify(st),true))toast('❌ بازیابی انجام نشد');}).catch(function(){toast('❌ فایل خوانده نشد');});};i.click();}
+/* ---- self-test used by the panel ---- */
+async function test(){var r={};
+  try{set0.call(ls,'__t','1');r.ls=ls.getItem('__t')==='1';ls.removeItem('__t');}catch(e){r.ls=false;}
+  try{await iPut('__t',{x:1});r.idb=(await iGet('__t')).x===1;await iDel('__t');}catch(e){r.idb=false;}
+  try{await cPut({x:1},'__t');r.cache=(await cGet('__t')).x===1;}catch(e){r.cache=false;}
+  try{await oPut({x:1},'t.json');r.opfs=(await oGet('t.json')).x===1;}catch(e){r.opfs=false;}
+  return r;}
+/* ---- panel ---- */
+var panel=null;
+function ic(v){return v===true?'✅':v===false?'❌':'…';}
+async function open(){
+  if(panel)panel.remove();panel=document.createElement('div');
+  panel.style.cssText='position:fixed;inset:0;z-index:2147483646;background:#000a;display:flex;align-items:center;justify-content:center;padding:12px;direction:rtl';
+  var card=document.createElement('div');card.style.cssText='background:#1f3d1a;color:#fff;border:1px solid #6a9;border-radius:16px;padding:14px;width:min(420px,100%);max-height:88vh;overflow:auto;font:14px/1.7 system-ui,sans-serif';
+  panel.appendChild(card);document.body.appendChild(panel);
+  panel.onclick=function(e){if(e.target===panel)panel.remove();};
+  nowSave('panel-v2');await flush();
+  var t=await test(),lv=ls&&valid(ls.getItem(KEY)),lb=+(ls&&ls.getItem(FB)||0),days=lb?Math.floor((Date.now()-lb)/864e5):null;
+  var snaps=[];try{snaps=(await iAll()).filter(function(x){return x&&x.snap&&x.raw;}).sort(function(a,b){return b.at-a.at;}).slice(0,6);}catch(e){}
+  var h='<div style="font-weight:700;font-size:16px;margin-bottom:6px">💾 مرکز ذخیره‌ی دشت برکت</div>';
+  h+='<div>آخرین ذخیره: <b>'+(lv?new Date(lv.t).toLocaleString('fa-IR'):'—')+'</b></div>';
+  h+='<div>حافظه‌ی مرورگر '+ic(t.ls)+' · پایگاه‌داده '+ic(t.idb)+' · Cache '+ic(t.cache)+' · فایل داخلی '+ic(t.opfs)+'</div>';
+  h+='<div>حافظه‌ی پایدار: '+(S0.persist===true?'✅ فعال':'⚠️ فعال نیست (با نصب برنامه بهتر می‌شود)')+'</div>';
+  h+='<div>آخرین فایل پشتیبان: <b'+(days===null||days>3?' style="color:#ffd27a"':'')+'>'+(lb?fa(days)+' روز پیش':'هنوز نگرفته‌ای')+'</b></div>';
+  if(S0.err)h+='<div style="color:#ffb0b0">خطا: '+S0.err+'</div>';
+  var bs='display:block;width:100%;margin:6px 0;padding:10px;border:0;border-radius:10px;background:#3f7d3a;color:#fff;font:inherit';
+  h+='<button data-a="save" style="'+bs+'">💾 ذخیره‌ی همین الان</button><button data-a="share" style="'+bs+'">📤 ارسال فایل پشتیبان (تلگرام، Drive…)</button><button data-a="dl" style="'+bs+'">📥 دانلود فایل پشتیبان</button><button data-a="imp" style="'+bs+'">📂 بازیابی از فایل</button>';
+  if(snaps.length){h+='<div style="margin-top:8px;font-weight:700">🕘 نسخه‌های قبلی</div>';snaps.forEach(function(s,i){var v=valid(s.raw);if(v)h+='<button data-a="snap" data-i="'+i+'" style="'+bs+';background:#2c5a29;padding:7px">'+new Date(s.at).toLocaleString('fa-IR')+' · سکه: '+fa(Math.floor(v.o.coins||0))+'</button>';});}
+  h+='<button data-a="x" style="'+bs+';background:#555">بستن</button>';
+  card.innerHTML=h;
+  card.onclick=function(e){var b=e.target.closest('button');if(!b)return;var a=b.dataset.a;
+    if(a==='save'){nowSave('manual-v2');flush().then(function(){toast('✅ ذخیره شد');});}
+    else if(a==='share')share();else if(a==='dl')download();else if(a==='imp')pick();
+    else if(a==='snap'){var s=snaps[+b.dataset.i];if(s&&confirm('به این نسخه برگردیم؟ (نسخه‌ی فعلی هم به‌عنوان اضطراری نگه داشته می‌شود)'))apply(s.raw,true);}
+    else panel.remove();};
+}
+function btn(){var b=document.createElement('button');b.textContent='💾';b.setAttribute('aria-label','مرکز ذخیره');
+  b.style.cssText='position:fixed;left:8px;bottom:calc(8px + env(safe-area-inset-bottom,0px));z-index:2147483000;width:34px;height:34px;border-radius:50%;border:1px solid #fff5;background:#14281488;color:#fff;font-size:16px;opacity:.6;padding:0';
+  b.onclick=open;document.body.appendChild(b);}
+if(document.body)btn();else document.addEventListener('DOMContentLoaded',btn);
+window.__dashtSave={status:S0,test:test,payload:payload,flush:flush,open:open,valid:valid};
+})();
+
 </script>
 
 <title>دشت برکت — Production v378</title>
